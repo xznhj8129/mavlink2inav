@@ -2,10 +2,12 @@
 import math
 from unavlib.control import UAVControl
 from unavlib.control import geospatial
+from unavlib.modules.utils import inavutil
 from pymavlink import mavutil
 import time
 import inspect 
 import traceback
+import random
 import asyncio
 
 # https://github.com/ArduPilot/pymavlink/blob/master/mavutil.py
@@ -203,7 +205,7 @@ class Telemetry:
         )
 
 class MavlinkControl:
-    def __init__(self, inav_conn, platform_type=mavutil.mavlink.MAV_TYPE_QUADROTOR, connection_string='udpout:localhost:14550', use_mavlink2=True):
+    def __init__(self, inav_conn, inav_type=mavutil.mavlink.MAV_TYPE_QUADROTOR, connection_string='udpout:localhost:14550', use_mavlink2=True):
         self.mavconn = mavutil.mavlink_connection(
             connection_string,
             source_system=1,
@@ -214,24 +216,46 @@ class MavlinkControl:
         self.running = True
         self.start_time = time.time()
         self.autopilot = mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA
-        self.type = platform_type
+        match inav_type:
+            case 0: # MULTIROTOR
+                self.type = mavutil.mavlink.MAV_TYPE_QUADROTOR
+            case 1: # AIRPLANE
+                self.type = mavutil.mavlink.MAV_TYPE_FIXED_WING
+            case 2: # HELICOPTER
+                self.type = mavutil.mavlink.MAV_TYPE_HELICOPTER
+            case 3: # TRICOPTER
+                self.type = mavutil.mavlink.MAV_TYPE_TRICOPTER
+            case 4: # ROVER
+                self.type = mavutil.mavlink.MAV_TYPE_GROUND_ROVER
+            case 5: # BOAT
+                self.type = mavutil.mavlink.MAV_TYPE_SURFACE_BOAT
+            case 6: # ??? 
+                self.type = mavutil.mavlink.MAV_TYPE_GENERIC
+            case _: #
+                raise Exception("Error: Invalid vehicle type")
+        self.inav_platform_type = inav_type
         self.inavctl = inav_conn
+        self.control_mode = 0
+        self.control_active = False
 
+
+        # Flight variables, this needs work
+        self.armed = False
+        self.flying = False
+        self.takeoff = False
+        self.failsafe_recovery = False
+        self.failure = 0
         self.start_pos = geospatial.GPSposition(45.0, -73.0, 0)
         self.attitude = {'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0, 'rollspeed': 0.0, 'pitchspeed': 0.0, 'yawspeed': 0.0}
         self.position = self.start_pos
         self.gps_speed = [0.0, 0.0, 0.0]
         self.battery = {'voltage': 11.1, 'current': 1.0, 'remaining': 100}
-        self.armed = False
         self.mode = 'STABILIZE'
         self.modes = mavutil.AP_MAV_TYPE_MODE_MAP[self.type]
         self.modes_index = dict_reverse(self.modes)
         self.mode_id = self.modes_index[self.mode]
-
         self.inav_last_modes_cmd = []
-
         self.system_status = mavutil.mavlink.MAV_STATE_STANDBY
-        self.flying = False
         self.battery = {'voltage': 11.1, 'current': 1.0, 'remaining': 100, 'temperature': 0.0, 'mahdrawn': 0}
         self.sys_status = {'voltage_battery': 11.1, 'current_battery': 1.0, 'battery_remaining': 100, 'errors': 0}
         self.global_position_origin = self.start_pos
@@ -239,8 +263,10 @@ class MavlinkControl:
         self.rc_channels = [0] * 16
         self.rssi = 255
 
+
         # Mission storage and state tracking
-        self.destination = geospatial.GPSposition(0.0, 0.0, 0)
+        self.gcs_wp_set = False
+        self.guided_dest = geospatial.GPSposition(0.0, 0.0, 0)
         self.mission_download = False
         self.mission_items = []
         self.mission_id = 0
@@ -250,16 +276,172 @@ class MavlinkControl:
         # Initialize telemetry
         self.telemetry = Telemetry(self, self.mavconn, self.start_time)
 
-    def update(self):
-        if len(self.mission_items) == 0:
-            self.mission_state = mavutil.mavlink.MISSION_STATE_NO_MISSION
 
-        elif self.mode_id == 3 and self.mission_state in (2,4):
-            self.mission_state = mavutil.mavlink.MISSION_STATE_ACTIVE
-            self.current_mission_seq = 0
+    def ap_to_inav_modes(self, apmode):
+        match apmode:
+            case 0: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # STABILIZE
+                    return [ inavutil.modesID.ANGLE ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # MANUAL
+                    return [ inavutil.modesID.MANUAL ]
 
-        elif self.mode_id != 3 and self.mission_state == 3:
-            self.mission_state = mavutil.mavlink.MISSION_STATE_PAUSED
+            case 1: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # ACRO
+                    return [  ]  # INAV HAS NO MODE ID DEFINED FOR ACRO AND I'M PISSED
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # CIRCLE
+                    return [ inavutil.modesID.NAV_POSHOLD ]
+
+            case 2: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # ALT_HOLD
+                    return [ inavutil.modesID.NAV_ALTHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # STABILIZE
+                    return [ inavutil.modesID.ANGLE ]
+
+            case 3: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AUTO
+                    return [ inavutil.modesID.NAV_WP ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # TRAINING
+                    return [ inavutil.modesID.MANUAL ]
+
+            case 4:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # GUIDED
+                    return [ inavutil.modesID.GCS_NAV, inavutil.modesID.NAV_POSHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # ACRO
+                    return [  ]
+
+            case 5: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # LOITER
+                    return [ inavutil.modesID.NAV_POSHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # FBWA
+                    return [ inavutil.modesID.NAV_COURSE_HOLD ]
+
+            case 6:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # RTL
+                    return [ inavutil.modesID.NAV_RTH ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # FBWB
+                    return [ inavutil.modesID.NAV_COURSE_HOLD , inavutil.modesID.ANG_HOLD]
+
+            case 7: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # CIRCLE
+                    return [ inavutil.modesID.NAV_POSHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # CRUISE
+                    return [ inavutil.modesID.NAV_CRUISE ]
+
+            case 8: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # POSITION
+                    return [ inavutil.modesID.NAV_POSHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # AUTOTUNE
+                    return [ inavutil.modesID.AUTO_TUNE ]
+
+            case 9:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # LAND
+                    return [ inavutil.modesID.NAV_POSHOLD ]  
+
+            case 10:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # OF_LOITER
+                    return [ inavutil.modesID.NAV_POSHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # AUTO
+                    return [ inavutil.modesID.NAV_WP ]
+
+            case 11: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # DRIFT
+                    return [ inavutil.modesID.ANGLE ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # RTL
+                    return [ inavutil.modesID.NAV_RTH ]
+
+            case 12: 
+                if self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # LOITER
+                    return [ inavutil.modesID.NAV_POSHOLD ]
+
+            case 13: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # SPORT
+                    return [  ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # TAKEOFF
+                    return [ inavutil.modesID.ANGLE ]
+
+            case 14: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # FLIP
+                    return None
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # AVOID_ADSB
+                    return None
+
+            case 15: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AUTOTUNE
+                    return [ inavutil.modesID.AUTO_TUNE ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # GUIDED
+                    return [ inavutil.modesID.GCS_NAV, inavutil.modesID.NAV_POSHOLD ] 
+
+            case 16: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # POSHOLD
+                    return [ inavutil.modesID.NAV_POSHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # INITIALISING
+                    return [ inavutil.modesID.NAV_MANUAL ]
+
+            case 17:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # BRAKE
+                    return [ inavutil.modesID.NAV_POSHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QSTABILIZE
+                    return [ inavutil.modesID.NAV_ANGLE ]
+
+            case 18:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # THROW
+                    return None
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QHOVER
+                    return [ inavutil.modesID.NAV_POSHOLD ]
+
+            case 19: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AVOID ADSB
+                    return None
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QLOITER
+                    return [ inavutil.modesID.NAV_POSHOLD ]
+
+            case 20: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # GUIDED_NOGPS
+                    return [ inavutil.modesID.GCS_NAV, inavutil.modesID.NAV_POSHOLD ] 
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QLAND
+                    return [ inavutil.modesID.NAV_POSHOLD ]
+
+            case 21: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # SMART_RTL
+                    return [ inavutil.modesID.NAV_RTH ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QRTL
+                    return [ inavutil.modesID.NAV_RTH ]
+
+            case 22:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # FLOWHOLD
+                    return [ inavutil.modesID.NAV_POSHOLD ]  
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QAUTOTUNE
+                    return [ inavutil.modesID.AUTOTUNE ]
+
+            case 23: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # FOLLOW
+                    return [ inavutil.modesID.GCS_NAV, inavutil.modesID.NAV_POSHOLD ] 
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QACRO
+                    return [  ]
+
+            case 24: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # ZIGZAG
+                    return None
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # THERMAL
+                    return None
+
+            case 25: 
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # SYSTEMID
+                    return [ inavutil.modesID.MANUAL ] 
+                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # LOITERALTQLAND
+                    return [ inavutil.modesID.POSHOLD ]
+
+            case 26:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AUTOROTATE
+                    return None
+
+            case 27:
+                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AUTO_RTL
+                    return [ inavutil.modesID.NAV_RTH ]
+
+            case _:
+                return None
+
 
     def translate_command(self, command_id):
         if command_id in mavutil.mavlink.enums['MAV_CMD']:
@@ -343,19 +525,35 @@ class MavlinkControl:
         else:
             print(f"Invalid mission item sequence: {seq}")
 
-
-
-    def arm(self, arm_disarm):
+    async def arm(self, arm_disarm):
         # arm checks here
-        self.inavctl.set_mode(self.inavctl.inav.modesID.ARM, on=arm_disarm)
+        self.inavctl.set_mode(inavutil.modesID.ARM, on=arm_disarm)
         for i in range(3):
+            await asyncio.sleep(1)
             self.armed = self.inavctl.armed
-            if self.armed:
+            if self.armed == arm_disarm:
                 break
-            time.sleep(1)
+
+    async def set_guided_wp(self):
+        #if self.mode == "GUIDED" and not self.gcs_wp_set and self.armed and inavutil.modesID.GCS_NAV in self.inavctl.get_active_modes():
+        t = time.time()
+        print(f"setting guided wp {self.guided_dest}")
+        while inavutil.modesID.GCS_NAV not in self.inavctl.get_board_modes():
+            print(self.inav_mode, self.inavctl.get_board_modes())
+            print('waiting.....')
+            await asyncio.sleep(1)
+            if time.time() - t > 30:
+                raise Exception("timeout error on waiting for GCS NAV mode")
+        print('sending')
+        wp = self.inavctl.set_wp(255, 1, self.guided_dest.lat, self.guided_dest.lon, self.guided_dest.alt, 0, 0, 0, 0)
+        print(f'return: {wp}')
+        self.gcs_wp_set = True
+        print('guided wp set')
 
     def set_mode(self, mode_id):
         if mode_id == self.modes_index["AUTO"] and len(self.mission_items)==0:
+            return False
+        if mode_id == self.modes_index["GUIDED"] and not self.inavctl.armed:
             return False
 
         self.mode_id = mode_id
@@ -369,181 +567,19 @@ class MavlinkControl:
             self.inavctl.set_mode(inav_mode_id, on=True)
 
         self.inav_last_modes_cmd = self.inav_mode
+        
+        if self.mode == "GUIDED":
+            self.gcs_wp_set = False
+
         #print('Active modes:')
         #for i in self.inavctl.get_active_modes():
-        #    print('\t',i, self.inavctl.inav.modesID.get(i))
-        print(f"Flight mode changed to: {self.mode} ({[self.inavctl.inav.modesID.get(i) for i in self.inav_mode]})")
+        #    print('\t',i, inavutil.modesID.get(i))
+        print(f"Flight mode changed to: {self.mode} ({[inavutil.modesID.get(i) for i in self.inav_mode]})")
         #print('inavctl rc:',self.inavctl.channels)
         #print('real rc:',self.inavctl.board.RC['channels'])
         return True
 
-
-    def ap_to_inav_modes(self, apmode):
-        match apmode:
-            case 0: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # STABILIZE
-                    return [ self.inavctl.inav.modesID.ANGLE ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # MANUAL
-                    return [ self.inavctl.inav.modesID.MANUAL ]
-
-            case 1: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # ACRO
-                    return [  ]  # INAV HAS NO MODE ID DEFINED FOR ACRO AND I'M PISSED
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # CIRCLE
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]
-
-            case 2: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # ALT_HOLD
-                    return [ self.inavctl.inav.modesID.NAV_ALTHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # STABILIZE
-                    return [ self.inavctl.inav.modesID.ANGLE ]
-
-            case 3: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AUTO
-                    return [ self.inavctl.inav.modesID.NAV_WP ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # TRAINING
-                    return [ self.inavctl.inav.modesID.MANUAL ]
-
-            case 4:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # GUIDED
-                    return [ self.inavctl.inav.modesID.GCS_NAV, self.inavctl.inav.modesID.NAV_POSHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # ACRO
-                    return [  ]
-
-            case 5: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # LOITER
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # FBWA
-                    return [ self.inavctl.inav.modesID.NAV_COURSE_HOLD ]
-
-            case 6:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # RTL
-                    return [ self.inavctl.inav.modesID.RTH ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # FBWB
-                    return [ self.inavctl.inav.modesID.NAV_COURSE_HOLD , self.inavctl.inav.modesID.ANG_HOLD]
-
-            case 7: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # CIRCLE
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # CRUISE
-                    return [ self.inavctl.inav.modesID.NAV_CRUISE ]
-
-            case 8: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # POSITION
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # AUTOTUNE
-                    return [ self.inavctl.inav.modesID.AUTO_TUNE ]
-
-            case 9:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # LAND
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]  
-
-            case 10:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # OF_LOITER
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # AUTO
-                    return [ self.inavctl.inav.modesID.NAV_WP ]
-
-            case 11: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # DRIFT
-                    return [ self.inavctl.inav.modesID.ANGLE ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # RTL
-                    return [ self.inavctl.inav.modesID.RTH ]
-
-            case 12: 
-                if self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # LOITER
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]
-
-            case 13: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # SPORT
-                    return [  ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # TAKEOFF
-                    return [ self.inavctl.inav.modesID.NAV_LAUNCH ]
-
-            case 14: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # FLIP
-                    return None
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # AVOID_ADSB
-                    return None
-
-            case 15: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AUTOTUNE
-                    return [ self.inavctl.inav.modesID.AUTO_TUNE ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # GUIDED
-                    return [ self.inavctl.inav.modesID.GCS_NAV, self.inavctl.inav.modesID.NAV_POSHOLD ] 
-
-            case 16: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # POSHOLD
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # INITIALISING
-                    return [ self.inavctl.inav.modesID.NAV_MANUAL ]
-
-            case 17:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # BRAKE
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QSTABILIZE
-                    return [ self.inavctl.inav.modesID.NAV_ANGLE ]
-
-            case 18:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # THROW
-                    return None
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QHOVER
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]
-
-            case 19: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AVOID ADSB
-                    return None
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QLOITER
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]
-
-            case 20: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # GUIDED_NOGPS
-                    return [ self.inavctl.inav.modesID.GCS_NAV, self.inavctl.inav.modesID.NAV_POSHOLD ] 
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QLAND
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]
-
-            case 21: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # SMART_RTL
-                    return [ self.inavctl.inav.modesID.RTH ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QRTL
-                    return [ self.inavctl.inav.modesID.RTH ]
-
-            case 22:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # FLOWHOLD
-                    return [ self.inavctl.inav.modesID.NAV_POSHOLD ]  
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QAUTOTUNE
-                    return [ self.inavctl.inav.modesID.AUTOTUNE ]
-
-            case 23: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # FOLLOW
-                    return [ self.inavctl.inav.modesID.GCS_NAV, self.inavctl.inav.modesID.NAV_POSHOLD ] 
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # QACRO
-                    return [  ]
-
-            case 24: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # ZIGZAG
-                    return None
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # THERMAL
-                    return None
-
-            case 25: 
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # SYSTEMID
-                    return [ self.inavctl.inav.modesID.MANUAL ] 
-                elif self.type == mavutil.mavlink.MAV_TYPE_FIXED_WING: # LOITERALTQLAND
-                    return [ self.inavctl.inav.modesID.POSHOLD ]
-
-            case 26:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AUTOROTATE
-                    return None
-
-            case 27:
-                if self.type == mavutil.mavlink.MAV_TYPE_QUADROTOR: # AUTO_RTL
-                    return [ self.inavctl.inav.modesID.RTH ]
-
-            case _:
-                return None
-
-    def receive_messages(self):
+    async def receive_messages(self):
         msg = self.mavconn.recv_match(blocking=False)
         if msg is not None:
             if msg.get_type() == 'COMMAND_LONG':
@@ -560,11 +596,10 @@ class MavlinkControl:
                 # ARM/DISARM
                 elif msg.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
                     arm_disarm = msg.param1 == 1.0
-                    self.arm(arm_disarm)
+                    await self.arm(arm_disarm)
                     reply = self.armed == arm_disarm
                     print(f"Vehicle {'armed' if self.armed else 'disarmed'}")
-
-                    self.system_status = mavutil.mavlink.MAV_STATE_ACTIVE #fake it for now
+                    self.system_status = mavutil.mavlink.MAV_STATE_ACTIVE if self.armed else mavutil.mavlink.MAV_STATE_STANDBY
                 
                 # mode change
                 elif msg.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
@@ -573,12 +608,11 @@ class MavlinkControl:
                     #print(f"Mode changed: Sending ACK for mode change to {self.mode}")
                     self.inavctl
 
-                # mission start
                 elif msg.command == mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE:
                     print(f"Message requested: {self.translate_command(msg.param1)}")
                     reply = False
 
-                
+                # mission start
                 elif msg.command == mavutil.mavlink.MAV_CMD_MISSION_START:
                     print("Command: Mission start")
                     reply = self.set_mode(self.modes_index["AUTO"])
@@ -696,6 +730,12 @@ class MavlinkControl:
                 if msg.command == mavutil.mavlink.MAV_CMD_DO_REPOSITION:
                     print(f"Received MAV_CMD_DO_REPOSITION: Speed={msg.param1} m/s, Bitmask={msg.param2}, "
                         f"Radius={msg.param3} m, Yaw={msg.param4} deg, Latitude={msg.x}, Longitude={msg.y}, Altitude={msg.z}")
+                    self.guided_dest.lat = msg.x / 1e7
+                    self.guided_dest.lon = msg.y / 1e7
+                    self.guided_dest.alt = msg.z
+                    self.gcs_wp_set = False
+                    print('trying to fucking set wp')
+                    asyncio.create_task(self.set_guided_wp())
                 else:
                     print(f"Received COMMAND_INT: Command {msg.command}, Coordinates (Lat: {msg.x}, Lon: {msg.y}, Alt: {msg.z})")
 
@@ -713,26 +753,96 @@ class MavlinkControl:
             else: 
                 print(f"Received -> {msg.to_dict()}")
 
-    
+    async def takeoff_program(self, set_alt):
+
+        if self.inav_platform_type == 0: # multirotor
+            pass
+
+        elif self.inav_platform_type == 1: #fixed wing
+            self.takeoff = 1
+            #self.inavctl.set_mode(inavutil.modesID.ANGLE, on=True)
+            #await asyncio.sleep(1)
+            print('Taking off')
+            self.inavctl.set_rc_channel('throttle',2000)
+            uavalt = 0
+            t=time.time()
+
+            while uavalt<set_alt :
+                self.inavctl.set_rc_channel('throttle',2100)
+                self.inavctl.set_rc_channel('pitch',1100)
+                #uavspeed = self.inavctl.get_gps_data()['speed']
+                uavalt = self.inavctl.get_altitude()
+                #imu = self.inavctl.get_imu()
+                print('Alt:', uavalt)
+                await asyncio.sleep(0.2)
+                if time.time() - t > 30:
+                    print('Takeoff failed')
+                    self.takeoff = -1 #failed
+                    return False
+
+            await asyncio.sleep(1)
+            self.inavctl.set_rc_channel('pitch',1500)
+            print("Takeoff success")
+            self.takeoff = 2 # success
+            self.flying = True
+            self.set_mode(self.modes_index["LOITER"])
+            return True
+
+    def update(self):
+        if len(self.mission_items) == 0:
+            self.mission_state = mavutil.mavlink.MISSION_STATE_NO_MISSION
+
+        elif self.mode_id == 3 and self.mission_state in (2,4):
+            self.mission_state = mavutil.mavlink.MISSION_STATE_ACTIVE
+            self.current_mission_seq = 0
+
+        elif self.mode_id != 3 and self.mission_state == 3:
+            self.mission_state = mavutil.mavlink.MISSION_STATE_PAUSED
+
+        if self.control_mode == 0:
+            self.control_active = self.inavctl.msp_override_active
+
+        if self.failure == 0:
+            self.system_status = mavutil.mavlink.MAV_STATE_ACTIVE if self.armed else mavutil.mavlink.MAV_STATE_STANDBY
+        else:
+            self.system_status = mavutil.mavlink.MAV_STATE_CRITICAL
+        self.armed = self.inavctl.armed
+
+            
     async def mav_ctl(self):
         print("Starting MAVLINK interface...")
         try:
-            set_alt = 50
+            #set_alt = 50
+
             last_msp = time.time()
             self.inavctl.debugprint = False
-            self.inavctl.modes.keys()
-            self.inavctl.new_supermode('GOTO', [self.inavctl.inav.modesID.GCS_NAV, self.inavctl.inav.modesID.NAV_POSHOLD])
-            #self.inavctl.set_mode(self.inavctl.inav.modesID.MSP_RC_OVERRIDE, on=True)
+            #self.inavctl.modes.keys()
+            #self.inavctl.new_supermode('GOTO', [inavutil.modesID.GCS_NAV, inavutil.modesID.NAV_POSHOLD])
+
+            if self.control_mode == 1:
+                self.control_active = True
+
             while self.running:
                 if not self.inavctl.run: 
                     self.running = False
                     break
+                
                 current_time = time.time()
                 self.update()
                 self.telemetry.send(current_time)
-                self.receive_messages()
+                await self.receive_messages()
 
                 if time.time()-last_msp >= 0.1:
+                    #print([inavutil.modesID.get(i) for i in self.inavctl.get_board_modes()])
+                    #print(inavutil.modesID.FAILSAFE)
+                    if inavutil.modesID.FAILSAFE in self.inavctl.get_board_modes() and not self.failsafe_recovery:
+                        self.failsafe_recovery = True
+                        print('FS RECOVERY')
+                        self.inavctl.set_rc_channel('pitch',random.uniform(1000,2000))
+                    elif inavutil.modesID.FAILSAFE not in self.inavctl.get_board_modes() and self.failsafe_recovery:
+                        self.inavctl.set_rc_channel('pitch',1500)
+                        self.failsafe_recovery = False
+
                     gpsd = self.inavctl.get_gps_data()
                     alt = self.inavctl.get_altitude()
                     gyro = self.inavctl.get_attitude()
@@ -762,9 +872,14 @@ class MavlinkControl:
                     nav_status = self.inavctl.get_nav_status()
                     #print(nav_status)
 
+                if self.mode == "TAKEOFF" and self.armed and not self.flying and self.takeoff==0:
+                    asyncio.create_task(self.takeoff_program(100))
+                if self.mode == "TAKEOFF" and self.takeoff == -1:
+                    self.set_mode(self.modes_index["MANUAL"])
+
                 #vector = geospatial.gps_to_vector(pos, wp)
                 #print('\n')
-                #print('Channels:', inavctl.board.RC['channels'])
+                #print('Channels:', self.inavctl.board.RC['channels'])
                 #inavctl.set_mode("MSP RC OVERRIDE", on=True)
                 #print('Active modes:', self.inavctl.get_active_modes())
                 #print('Position:', self.position)
@@ -795,13 +910,20 @@ class MavlinkControl:
 
 
 async def main():
-    uavctl = UAVControl(device='/dev/ttyUSB0', baudrate=115200, platform="AIRPLANE")
+    inav_platform = inavutil.flyingPlatformType.PLATFORM_AIRPLANE
+    uavctl = UAVControl(device='/dev/ttyUSB0', baudrate=115200, platform=inav_platform)
     uavctl.msp_override_channels=[1, 2, 3, 4, 5, 6, 14]
-    uavctl.msp_receiver = True
+    mav = MavlinkControl(inav_conn=uavctl, inav_type=inav_platform, use_mavlink2=True)
+
+    OVERRIDE_CONTROL = 0
+    MSP_RC_CONTROL = 1
+    MAVLINK_RC_CONTROL = 2
+
+    mav.control_mode = MSP_RC_CONTROL
+    uavctl.msp_receiver = mav.control_mode == 1
 
     try:
         await uavctl.connect()
-        mav = MavlinkControl(inav_conn=uavctl, platform_type=mavutil.mavlink.MAV_TYPE_FIXED_WING, use_mavlink2=True)
         print("Connected to the flight controller")
         flight_control_task = asyncio.create_task(uavctl.flight_loop())
         mavloop = asyncio.create_task(mav.mav_ctl())
