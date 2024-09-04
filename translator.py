@@ -537,18 +537,13 @@ class MavlinkControl:
     async def set_guided_wp(self):
         #if self.mode == "GUIDED" and not self.gcs_wp_set and self.armed and inavutil.modesID.GCS_NAV in self.inavctl.get_active_modes():
         t = time.time()
-        print(f"setting guided wp {self.guided_dest}")
         while inavutil.modesID.GCS_NAV not in self.inavctl.get_board_modes():
             print(self.inav_mode, self.inavctl.get_board_modes())
-            print('waiting.....')
             await asyncio.sleep(1)
             if time.time() - t > 30:
                 raise Exception("timeout error on waiting for GCS NAV mode")
-        print('sending')
         wp = self.inavctl.set_wp(255, 1, self.guided_dest.lat, self.guided_dest.lon, self.guided_dest.alt, 0, 0, 0, 0)
-        print(f'return: {wp}')
         self.gcs_wp_set = True
-        print('guided wp set')
 
     def set_mode(self, mode_id):
         if mode_id == self.modes_index["AUTO"] and len(self.mission_items)==0:
@@ -667,7 +662,8 @@ class MavlinkControl:
             
             elif msg.get_type() == 'MISSION_ITEM_INT':
                 print(f"Received {msg.get_type()}: Sequence {msg.seq}, Command {msg.command}, " 
-                    f"Coordinates (Lat: {msg.x}, Lon: {msg.y}, Alt: {msg.z})")
+                    f"Coordinates (Frame: {msg.frame}, Lat: {msg.x}, Lon: {msg.y}, Alt: {msg.z}), Param1: {msg.param1}, "
+                    f"Param2: {msg.param2}, Param3: {msg.param3}")
 
                 self.mission_items.append(msg)  # Store the mission item
 
@@ -689,6 +685,66 @@ class MavlinkControl:
                         target_component=self.mavconn.target_component,
                         type=result
                     )
+
+                    # send mission items to INAV
+                    lastalt = 0
+                    for i in range(len(self.mission_items)):
+                        if i==0:
+                            continue
+                        wpi = i
+                        wp = self.mission_items[i]
+                        lat = wp.x / 1e7
+                        lon = wp.y / 1e7
+                        alt = wp.z
+                        p1 = 0
+                        p2 = 0
+                        p3 = 0
+                        match wp.command:
+                            case mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
+                                wp_action = inavutil.navWaypointActions.NAV_WP_ACTION_WAYPOINT 
+                                p3 = 0
+                                # P3 defines the altitude mode. 0 (default, legacy) = Relative to Home, 1 = Absolute (AMSL)
+
+                            case mavutil.mavlink.MAV_CMD_NAV_LOITER_UNLIM:
+                                p1 = -1
+                                wp_action = inavutil.navWaypointActions.NAV_WP_ACTION_HOLD_TIME
+
+                            case mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME:
+                                wp_action = inavutil.navWaypointActions.NAV_WP_ACTION_HOLD_TIME
+                                p1 = wp.param1
+                                # P1 = time, P3 as above
+
+                            case mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH:
+                                wp_action = inavutil.navWaypointActions.NAV_WP_ACTION_RTH
+                                p1 = 0
+                                alt = lastalt
+                                # P1>0 = Land
+
+                            case mavutil.mavlink.MAV_CMD_NAV_LAND:
+                                #wp_action = inavutil.navWaypointActions.NAV_WP_ACTION_LAND
+                                wp_action = inavutil.navWaypointActions.NAV_WP_ACTION_RTH
+                                alt = lastalt
+                                p1 = 1
+
+                            case mavutil.mavlink.MAV_CMD_NAV_TAKEOFF:
+                                self.wp_takeoff = True
+                                wp_action = None
+                            case _:
+                                wp_action = None
+
+                        print()
+                        print(wp)
+                        if not wp_action:
+                            print('Error: unsupported waypoint type',wp_action)
+                            break
+                        lastalt = alt
+                        wpflag = 165 if i == len(self.mission_items)-1 else 0
+                        print('inav wp',wpi, wp_action, lat, lon, alt, p1, p2, p3, wpflag)
+                        inavwp = self.inavctl.set_wp(wpi, wp_action, lat, lon, alt, p1, p2, p3, wpflag)
+                        print(self.inavctl.get_wp(i))
+
+
+
                     print(f"Sent MISSION_ACK: result={result}")
                     self.current_mission_seq = 0
                     self.mission_state = mavutil.mavlink.MISSION_STATE_NOT_STARTED
@@ -734,7 +790,6 @@ class MavlinkControl:
                     self.guided_dest.lon = msg.y / 1e7
                     self.guided_dest.alt = msg.z
                     self.gcs_wp_set = False
-                    print('trying to fucking set wp')
                     asyncio.create_task(self.set_guided_wp())
                 else:
                     print(f"Received COMMAND_INT: Command {msg.command}, Coordinates (Lat: {msg.x}, Lon: {msg.y}, Alt: {msg.z})")
@@ -806,6 +861,8 @@ class MavlinkControl:
             self.system_status = mavutil.mavlink.MAV_STATE_ACTIVE if self.armed else mavutil.mavlink.MAV_STATE_STANDBY
         else:
             self.system_status = mavutil.mavlink.MAV_STATE_CRITICAL
+
+        # detect arm conflict (script has switch to armed but vehicle disarmed etc)
         self.armed = self.inavctl.armed
 
             
@@ -873,7 +930,7 @@ class MavlinkControl:
                     #print(nav_status)
 
                 if self.mode == "TAKEOFF" and self.armed and not self.flying and self.takeoff==0:
-                    asyncio.create_task(self.takeoff_program(100))
+                    asyncio.create_task(self.takeoff_program(50))
                 if self.mode == "TAKEOFF" and self.takeoff == -1:
                     self.set_mode(self.modes_index["MANUAL"])
 
