@@ -205,7 +205,7 @@ class Telemetry:
         )
 
 class MavlinkControl:
-    def __init__(self, inav_conn, inav_type=mavutil.mavlink.MAV_TYPE_QUADROTOR, connection_string='udpout:localhost:14550', use_mavlink2=True):
+    def __init__(self, inav_conn, connection_string, inav_type=mavutil.mavlink.MAV_TYPE_QUADROTOR, use_mavlink2=True):
         self.mavconn = mavutil.mavlink_connection(
             connection_string,
             source_system=1,
@@ -215,6 +215,7 @@ class MavlinkControl:
         )
         self.running = True
         self.start_time = time.time()
+        self.system_id = 1
         self.autopilot = mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA
         match inav_type:
             case 0: # MULTIROTOR
@@ -272,6 +273,7 @@ class MavlinkControl:
         self.mission_id = 0
         self.current_mission_seq = 0
         self.mission_state = mavutil.mavlink.MISSION_STATE_NO_MISSION
+        self.takeoff_alt = 50
 
         # Initialize telemetry
         self.telemetry = Telemetry(self, self.mavconn, self.start_time)
@@ -525,35 +527,124 @@ class MavlinkControl:
         else:
             print(f"Invalid mission item sequence: {seq}")
 
-    async def arm(self, arm_disarm):
-        # arm checks here
-        self.inavctl.set_mode(inavutil.modesID.ARM, on=arm_disarm)
-        for i in range(3):
-            await asyncio.sleep(1)
-            self.armed = self.inavctl.armed
-            if self.armed == arm_disarm:
-                break
-
     async def set_guided_wp(self):
         #if self.mode == "GUIDED" and not self.gcs_wp_set and self.armed and inavutil.modesID.GCS_NAV in self.inavctl.get_active_modes():
         t = time.time()
         while inavutil.modesID.GCS_NAV not in self.inavctl.get_board_modes():
             print(self.inav_mode, self.inavctl.get_board_modes())
-            await asyncio.sleep(1)
-            if time.time() - t > 30:
+            await asyncio.sleep(0.5)
+            if time.time() - t > 5:
                 raise Exception("timeout error on waiting for GCS NAV mode")
         wp = self.inavctl.set_wp(255, 1, self.guided_dest.lat, self.guided_dest.lon, self.guided_dest.alt, 0, 0, 0, 0)
         self.gcs_wp_set = True
 
-    def set_mode(self, mode_id):
+    def send_home_position(self):
+        """
+        Sends the MAVLink HOME_POSITION message with the current home position data.
+        """
+        lat = int(self.start_pos.lat * 1e7)  # Latitude in WGS84, degrees * 1e7
+        lon = int(self.start_pos.lon * 1e7)  # Longitude in WGS84, degrees * 1e7
+        alt = int(self.start_pos.alt * 1000)  # Altitude in millimeters
+
+        # NED (North-East-Down) local coordinates
+        x = 0.0
+        y = 0.0
+        z = 0.0
+
+        # Quaternion for the orientation (set to NaN if not available)
+        q = [float('nan')] * 4
+
+        # Approach vector (optional, set to NaN if not available)
+        approach_x = float('nan')
+        approach_y = float('nan')
+        approach_z = float('nan')
+
+        # Timestamp (UNIX Epoch or time since boot)
+        time_usec = int(time.time() * 1e6)
+
+        # Send the HOME_POSITION message
+        self.mavconn.mav.home_position_send(
+            lat, lon, alt, x, y, z, q, approach_x, approach_y, approach_z, time_usec
+        )
+
+
+    async def cmd_arm(self, arm_disarm):
+        # arm checks here
+        self.inavctl.set_mode(inavutil.modesID.ARM, on=arm_disarm)
+        t = time.time()
+
+        while self.armed != arm_disarm:
+            await asyncio.sleep(0.5)
+            self.armed = self.inavctl.armed
+            if time.time() - t > 5:
+                print("timeout error on waiting for CMD ARM")
+                break
+            else:
+                self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, result=mavutil.mavlink.MAV_RESULT_IN_PROGRESS)
+
+        print(f"Vehicle {'armed' if self.armed else 'disarmed'}")
+        self.system_status = mavutil.mavlink.MAV_STATE_ACTIVE if self.armed else mavutil.mavlink.MAV_STATE_STANDBY
+        cmd_res = mavutil.mavlink.MAV_RESULT_ACCEPTED if self.armed == arm_disarm else mavutil.mavlink.MAV_RESULT_FAILED
+        self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, result=cmd_res)
+
+    async def arm(self, arm_disarm):
+        # arm checks here
+        self.inavctl.set_mode(inavutil.modesID.ARM, on=arm_disarm)
+        t = time.time()
+        while self.armed != arm_disarm:
+            await asyncio.sleep(0.1)
+            self.armed = self.inavctl.armed
+            if time.time() - t > 5:
+                print("timeout error on waiting for ARM")
+                return False
+        print(f"Vehicle {'armed' if self.armed else 'disarmed'}")
+        return True
+
+    async def mode_arm(self,arm_disarm, mode):
+        pass
+
+
+    async def set_ap_mode(self, mode_id):
+        print('Setting mode to',self.modes.get(mode_id, "UNKNOWN"))
         if mode_id == self.modes_index["AUTO"] and len(self.mission_items)==0:
-            return False
-        if mode_id == self.modes_index["GUIDED"] and not self.inavctl.armed:
-            return False
+            print('Error: Cannot set to AUTO, no waypoints on aircraft')
+            self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_DO_SET_MODE, result=mavutil.mavlink.MAV_RESULT_FAILED)
+            return None
+
+        elif mode_id == self.modes_index["GUIDED"] and not self.inavctl.armed:
+            print('Error: Cannot set to GUIDED, not armed')
+            self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_DO_SET_MODE, result=mavutil.mavlink.MAV_RESULT_FAILED)
+            return None
+
+        elif (mode_id == self.modes_index["TAKEOFF"] or mode_id == self.modes_index["AUTO"]) and not self.armed: # arm then takeoff
+            if mode_id == self.modes_index["TAKEOFF"] and self.flying or self.takeoff!=0:
+                print(f'Error: Cannot set to {self.modes.get(mode_id, "UNKNOWN")}, already flying')
+                self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_DO_SET_MODE, result=mavutil.mavlink.MAV_RESULT_FAILED)
+                return None
+
+            armtask = asyncio.create_task(self.arm(True))
+            t = time.time()
+            while not armtask.done():
+                await asyncio.sleep(0.5)
+                self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_DO_SET_MODE, result=mavutil.mavlink.MAV_RESULT_IN_PROGRESS)
+            armres = await armtask
+            if not armres:
+                self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_DO_SET_MODE, result=mavutil.mavlink.MAV_RESULT_FAILED)
+                return None
+            else:
+                self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_DO_SET_MODE, result=mavutil.mavlink.MAV_RESULT_ACCEPTED)
+                print(f'Vehicle armed by {self.modes.get(mode_id, "UNKNOWN")}')
+
+        if (mode_id == self.modes_index["TAKEOFF"] or mode_id == self.modes_index["AUTO"]) and self.takeoff == 0:
+            asyncio.create_task(self.takeoff_program(self.takeoff_alt, auto=(mode_id == self.modes_index["AUTO"])))
 
         self.mode_id = mode_id
         self.mode = self.modes.get(mode_id, "UNKNOWN")
-        self.inav_mode = self.ap_to_inav_modes(mode_id)
+
+        if mode_id == self.modes_index["AUTO"] and self.takeoff == 0:
+            self.inav_mode = self.ap_to_inav_modes(self.modes_index["TAKEOFF"])
+        else:
+            self.inav_mode = self.ap_to_inav_modes(mode_id)
         
         for inav_mode_id in self.inav_last_modes_cmd:
             self.inavctl.set_mode(inav_mode_id, on=False)
@@ -572,7 +663,47 @@ class MavlinkControl:
         print(f"Flight mode changed to: {self.mode} ({[inavutil.modesID.get(i) for i in self.inav_mode]})")
         #print('inavctl rc:',self.inavctl.channels)
         #print('real rc:',self.inavctl.board.RC['channels'])
-        return True
+        self.mavconn.mav.command_ack_send(command=mavutil.mavlink.MAV_CMD_DO_SET_MODE, result=mavutil.mavlink.MAV_RESULT_ACCEPTED)
+
+
+    async def takeoff_program(self, set_alt, auto=False):
+        if self.inav_platform_type == 0: # multirotor
+            pass
+
+        elif self.inav_platform_type == 1: #fixed wing
+            self.takeoff = 1
+            #self.inavctl.set_mode(inavutil.modesID.ANGLE, on=True)
+            #await asyncio.sleep(1)
+            print('Taking off')
+            self.inavctl.set_rc_channel('throttle',2000)
+            uavalt = 0
+            t=time.time()
+
+            while uavalt<set_alt :
+                self.inavctl.set_rc_channel('throttle',2100)
+                self.inavctl.set_rc_channel('pitch',1100)
+                #uavspeed = self.inavctl.get_gps_data()['speed']
+                uavalt = self.inavctl.get_altitude()
+                #imu = self.inavctl.get_imu()
+                print('Alt:', uavalt)
+                await asyncio.sleep(0.2)
+
+                if time.time() - t > 30:
+                    print('Takeoff failed')
+                    await self.set_ap_mode(self.modes_index["MANUAL"])
+                    self.takeoff = -1 #failed
+                    return False
+
+            await asyncio.sleep(1)
+            self.inavctl.set_rc_channel('pitch',1500)
+            print("Takeoff success")
+            self.takeoff = 2 # success
+            self.flying = True
+            if auto: 
+                await self.set_ap_mode(self.modes_index["AUTO"])
+            else:
+                await self.set_ap_mode(self.modes_index["LOITER"])
+            return True
 
     async def receive_messages(self):
         msg = self.mavconn.recv_match(blocking=False)
@@ -586,38 +717,45 @@ class MavlinkControl:
 
                 if msg.command == mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL:
                     #print(f"SET_MSG_INTERVAL: {self.translate_command(msg.param1)} {msg.param2}")
-                    reply = True # handle later
+                    reply = mavutil.mavlink.MAV_RESULT_ACCEPTED # handle later
 
                 # ARM/DISARM
                 elif msg.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
                     arm_disarm = msg.param1 == 1.0
-                    await self.arm(arm_disarm)
-                    reply = self.armed == arm_disarm
-                    print(f"Vehicle {'armed' if self.armed else 'disarmed'}")
-                    self.system_status = mavutil.mavlink.MAV_STATE_ACTIVE if self.armed else mavutil.mavlink.MAV_STATE_STANDBY
+                    asyncio.create_task(self.cmd_arm(arm_disarm))
+                    reply = mavutil.mavlink.MAV_RESULT_IN_PROGRESS
                 
                 # mode change
                 elif msg.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
                     mode_id = int(msg.param2)
-                    reply = self.set_mode(mode_id)
+                    asyncio.create_task(self.set_ap_mode(mode_id))
+                    reply = mavutil.mavlink.MAV_RESULT_IN_PROGRESS #self.set_ap_mode(mode_id)
                     #print(f"Mode changed: Sending ACK for mode change to {self.mode}")
-                    self.inavctl
+
+                elif msg.command == mavutil.mavlink.MAV_CMD_GET_HOME_POSITION:
+                    print('Home position requested')
+                    self.mavconn.mav.command_ack_send(
+                        command=mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                        result=mavutil.mavlink.MAV_RESULT_ACCEPTED
+                    )
+                    self.send_home_position()
 
                 elif msg.command == mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE:
                     print(f"Message requested: {self.translate_command(msg.param1)}")
-                    reply = False
+                    reply = mavutil.mavlink.MAV_RESULT_FAILED
 
                 # mission start
                 elif msg.command == mavutil.mavlink.MAV_CMD_MISSION_START:
                     print("Command: Mission start")
-                    reply = self.set_mode(self.modes_index["AUTO"])
+                    reply = mavutil.mavlink.MAV_RESULT_IN_PROGRESS #self.set_ap_mode(self.modes_index["AUTO"])
+
+                # MAV_CMD_GET_HOME_POSITION
 
                 else:
                     print(f"Received message: COMMAND_LONG -> {msg.to_dict()}, Command: {command_name} ({msg.command})")
 
                 if reply is not None:
-                    cmd_res = mavutil.mavlink.MAV_RESULT_ACCEPTED if reply == True else mavutil.mavlink.MAV_RESULT_FAILED
-                    self.mavconn.mav.command_ack_send(msg.command, cmd_res)
+                    self.mavconn.mav.command_ack_send(command = msg.command, result=reply)
 
             elif msg.get_type() == 'REQUEST_DATA_STREAM': # deprecated!
                 stream_name = mavutil.mavlink.enums['MAV_DATA_STREAM'].get(msg.req_stream_id).name
@@ -630,15 +768,15 @@ class MavlinkControl:
                 print(f"Received message: REQUEST_DATA_STREAM -> Stream: {stream_name}, Rate: {msg.req_message_rate}, Start/Stop: {msg.start_stop}")
 
 
-            #elif msg.get_type() == 'PARAM_REQUEST_LIST': # this makes things worse
-            #    print(f"Received PARAM_REQUEST_LIST -> {msg.to_dict()}")
-            #    self.mavconn.mav.param_value_send(
-            #        param_id=b'\x00' * 16,  # 16-byte empty parameter ID
-            #        param_value=0, 
-            #        param_type=0,
-            #        param_count=0,  
-            #        param_index=0 
-            #    )
+            elif False and msg.get_type() == 'PARAM_REQUEST_LIST': # this makes things worse
+                print(f"Received PARAM_REQUEST_LIST -> {msg.to_dict()}")
+                self.mavconn.mav.param_value_send(
+                    param_id=b'\x00' * 16,  # 16-byte empty parameter ID
+                    param_value=0, 
+                    param_type=0,
+                    param_count=0,  
+                    param_index=0 
+                )
 
             # handle this LATER 
             #elif msg.get_type() == 'PARAM_REQUEST_LIST':
@@ -688,10 +826,10 @@ class MavlinkControl:
 
                     # send mission items to INAV
                     lastalt = 0
+                    offset = 0
                     for i in range(len(self.mission_items)):
                         if i==0:
                             continue
-                        wpi = i
                         wp = self.mission_items[i]
                         lat = wp.x / 1e7
                         lon = wp.y / 1e7
@@ -728,20 +866,25 @@ class MavlinkControl:
 
                             case mavutil.mavlink.MAV_CMD_NAV_TAKEOFF:
                                 self.wp_takeoff = True
+                                self.takeoff_alt = wp.z
                                 wp_action = None
+                                offset+=1
+
                             case _:
                                 wp_action = None
 
-                        print()
-                        print(wp)
-                        if not wp_action:
-                            print('Error: unsupported waypoint type',wp_action)
-                            break
-                        lastalt = alt
-                        wpflag = 165 if i == len(self.mission_items)-1 else 0
-                        print('inav wp',wpi, wp_action, lat, lon, alt, p1, p2, p3, wpflag)
-                        inavwp = self.inavctl.set_wp(wpi, wp_action, lat, lon, alt, p1, p2, p3, wpflag)
-                        print(self.inavctl.get_wp(i))
+                        wpi = i - offset
+                        if wp_action:
+                            print()
+                            print(wp)
+                            lastalt = alt
+                            wpflag = 165 if i == len(self.mission_items)-1 else 0
+                            #print('inav wp',wpi, wp_action, lat, lon, alt, p1, p2, p3, wpflag)
+                            inavwp = self.inavctl.set_wp(wpi, wp_action, lat, lon, alt, p1, p2, p3, wpflag)
+                            print(self.inavctl.get_wp(i))
+                        #else:
+                            #print('Error: unsupported waypoint type',wp_action)
+                        #    break
 
 
 
@@ -805,43 +948,20 @@ class MavlinkControl:
             elif msg.get_type() == 'HEARTBEAT':
                 self.last_gcs_heartbeat = time.time()
 
+            elif msg.get_type() == 'SET_MODE':
+                print(msg)
+                print('SET_MODE',msg.custom_mode)
+                mode_id = int(msg.custom_mode)
+                self.set_ap_mode(mode_id)
+                asyncio.create_task(self.set_ap_mode(mode_id))
+
+            elif msg.get_type() == 'MANUAL_CONTROL':
+                pass
+                #print("MANUAL CONTROL SPAM:",msg)
+
             else: 
                 print(f"Received -> {msg.to_dict()}")
 
-    async def takeoff_program(self, set_alt):
-
-        if self.inav_platform_type == 0: # multirotor
-            pass
-
-        elif self.inav_platform_type == 1: #fixed wing
-            self.takeoff = 1
-            #self.inavctl.set_mode(inavutil.modesID.ANGLE, on=True)
-            #await asyncio.sleep(1)
-            print('Taking off')
-            self.inavctl.set_rc_channel('throttle',2000)
-            uavalt = 0
-            t=time.time()
-
-            while uavalt<set_alt :
-                self.inavctl.set_rc_channel('throttle',2100)
-                self.inavctl.set_rc_channel('pitch',1100)
-                #uavspeed = self.inavctl.get_gps_data()['speed']
-                uavalt = self.inavctl.get_altitude()
-                #imu = self.inavctl.get_imu()
-                print('Alt:', uavalt)
-                await asyncio.sleep(0.2)
-                if time.time() - t > 30:
-                    print('Takeoff failed')
-                    self.takeoff = -1 #failed
-                    return False
-
-            await asyncio.sleep(1)
-            self.inavctl.set_rc_channel('pitch',1500)
-            print("Takeoff success")
-            self.takeoff = 2 # success
-            self.flying = True
-            self.set_mode(self.modes_index["LOITER"])
-            return True
 
     def update(self):
         if len(self.mission_items) == 0:
@@ -865,6 +985,11 @@ class MavlinkControl:
         # detect arm conflict (script has switch to armed but vehicle disarmed etc)
         self.armed = self.inavctl.armed
 
+        if self.flying and not self.armed and self.altitude<1 and self.speed<=1:
+            self.flying = False
+            self.takeoff = 0
+            print('Landing detected')
+
             
     async def mav_ctl(self):
         print("Starting MAVLINK interface...")
@@ -873,11 +998,21 @@ class MavlinkControl:
 
             last_msp = time.time()
             self.inavctl.debugprint = False
+            print(self.inavctl.get_sensor_config())
+            print()
             #self.inavctl.modes.keys()
             #self.inavctl.new_supermode('GOTO', [inavutil.modesID.GCS_NAV, inavutil.modesID.NAV_POSHOLD])
 
             if self.control_mode == 1:
                 self.control_active = True
+
+            # already flying checkL
+            gpsd = self.inavctl.get_gps_data()
+            self.altitude = self.inavctl.get_altitude()
+            if gpsd['speed']>5 and self.attitude>10:
+                print('Oops, already in flight!')
+                self.flying = True
+                self.takeoff = 1
 
             while self.running:
                 if not self.inavctl.run: 
@@ -896,14 +1031,20 @@ class MavlinkControl:
                         self.failsafe_recovery = True
                         print('FS RECOVERY')
                         self.inavctl.set_rc_channel('pitch',random.uniform(1000,2000))
+
                     elif inavutil.modesID.FAILSAFE not in self.inavctl.get_board_modes() and self.failsafe_recovery:
                         self.inavctl.set_rc_channel('pitch',1500)
                         self.failsafe_recovery = False
 
                     gpsd = self.inavctl.get_gps_data()
-                    alt = self.inavctl.get_altitude()
                     gyro = self.inavctl.get_attitude()
-                    self.position = geospatial.GPSposition(gpsd['lat'], gpsd['lon'], alt)
+                    #self.inavctl.std_send(inavutil.msp.MSP_CURRENT_METERS)
+                    
+                    #print(f"{[inavutil.modesID.get(i) for i in self.inavctl.get_board_modes()]}")
+
+                    self.altitude = self.inavctl.get_altitude()
+                    self.position = geospatial.GPSposition(gpsd['lat'], gpsd['lon'], self.altitude)
+                    self.speed = gpsd['speed']
                     self.attitude =  {
                         'roll': math.radians(gyro['roll']), 
                         'pitch': math.radians(gyro['pitch']), 
@@ -928,11 +1069,6 @@ class MavlinkControl:
                         }
                     nav_status = self.inavctl.get_nav_status()
                     #print(nav_status)
-
-                if self.mode == "TAKEOFF" and self.armed and not self.flying and self.takeoff==0:
-                    asyncio.create_task(self.takeoff_program(50))
-                if self.mode == "TAKEOFF" and self.takeoff == -1:
-                    self.set_mode(self.modes_index["MANUAL"])
 
                 #vector = geospatial.gps_to_vector(pos, wp)
                 #print('\n')
@@ -970,7 +1106,7 @@ async def main():
     inav_platform = inavutil.flyingPlatformType.PLATFORM_AIRPLANE
     uavctl = UAVControl(device='/dev/ttyUSB0', baudrate=115200, platform=inav_platform)
     uavctl.msp_override_channels=[1, 2, 3, 4, 5, 6, 14]
-    mav = MavlinkControl(inav_conn=uavctl, inav_type=inav_platform, use_mavlink2=True)
+    mav = MavlinkControl(inav_conn=uavctl, connection_string='udpout:localhost:14550', inav_type=inav_platform, use_mavlink2=True)
 
     OVERRIDE_CONTROL = 0
     MSP_RC_CONTROL = 1
